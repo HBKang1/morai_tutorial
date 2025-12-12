@@ -1,0 +1,3 @@
+[submodule "MORAI_UDP_NetworkModule"]
+	path = MORAI_UDP_NetworkModule
+	url = https://github.com/HBKang1/MORAI_UDP_NetworkModule.git
