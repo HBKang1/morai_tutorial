@@ -1,0 +1,349 @@
+import csv
+import time
+import math
+import sys
+import threading
+import queue
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+
+# project_root = 현재 실행 디렉토리
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(PROJECT_ROOT / "MORAI_UDP_NetworkModule"))
+
+from lib.network.UDP import Receiver, Sender
+from lib.define.EgoNoisyInfoStatus import EgoNoisyInfoStatus
+from lib.define.EgoCtrlCmd import EgoCtrlCmd
+
+RECV_IP = '127.0.0.1'
+RECV_PORT = 9104
+SEND_PORT = 9093
+csv_path = "data/path.csv"
+
+# =====================================================
+# Global Path Loader
+# =====================================================
+def load_global_path(csv_path):
+    xs, ys = [], []
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            xs.append(float(row['PositionX (m)']))
+            ys.append(float(row['PositionY (m)']))
+    return xs, ys
+
+
+# =====================================================
+# print_step_log
+# =====================================================
+def print_step_log(step, x, y, yaw, speed, steer, accel, dt):
+    print(f"[Step {step}] Pos=({x:.2f}, {y:.2f})  "
+          f"Yaw={math.degrees(yaw):.2f}°  "
+          f"Speed={speed:.2f} m/s  "
+          f"Steer={math.degrees(steer):.2f}°  "
+          f"Accel={accel:.3f}  dt={dt:.3f}")
+
+
+# =====================================================
+# Pure Pursuit Predicted Path
+# =====================================================
+def predict_pure_pursuit_path(x, y, yaw, steer, wheelbase, horizon=20, ds=0.5):
+    k = math.tan(steer * 0.6) / wheelbase
+    pred_x = [x]
+    pred_y = [y]
+    pred_yaw = yaw
+    for _ in range(int(horizon / ds)):
+        x += ds * math.cos(pred_yaw)
+        y += ds * math.sin(pred_yaw)
+        pred_yaw += ds * k
+        pred_x.append(x)
+        pred_y.append(y)
+    return pred_x, pred_y
+
+
+# =====================================================
+# Pure Pursuit Controller
+# =====================================================
+class PurePursuit:
+    def __init__(self, lookahead=20.0, wheelbase=2.8):
+        self.lookahead = lookahead
+        self.wheelbase = wheelbase
+
+    def compute_steering(self, x, y, yaw, path_x, path_y):
+        min_dist = float('inf')         # 현재위치와 Path에서 가장 가까운 점 저장
+        closest_idx = 0                 # 차량 위치에서 가장 가까운 Global Path 인덱스
+        for i in range(len(path_x)):
+            d = (path_x[i] - x)**2 + (path_y[i] - y)**2
+            if d < min_dist:
+                min_dist = d
+                closest_idx = i
+
+        target_idx = closest_idx
+        for i in range(closest_idx, len(path_x)): # Lookahead 거리만큼 떨어진 목표점 찾기
+            if math.hypot(path_x[i] - x, path_y[i] - y) >= self.lookahead:
+                target_idx = i
+                break
+
+        tx, ty = path_x[target_idx], path_y[target_idx]
+        dx = math.cos(-yaw) * (tx - x) - math.sin(-yaw) * (ty - y)
+        dy = math.sin(-yaw) * (tx - x) + math.cos(-yaw) * (ty - y)
+        steer = math.atan2(2 * self.wheelbase * dy, self.lookahead**2)
+        return max(min(steer / 0.6, 1.0), -1.0)
+
+
+# =====================================================
+# PID Controller
+# =====================================================
+class PID:
+    def __init__(self, kp, ki, kd, target_speed):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.target_speed = target_speed
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+        # 로그
+        self.log_error = []
+        self.log_P = []
+        self.log_I = []
+        self.log_D = []
+        self.log_output = []
+        self.log_target_speed = []
+        self.log_current_speed = []
+
+    def compute(self, current_speed, dt):
+        # 안전: dt가 아주 작거나 0이면 derivative를 0으로 처리
+        if dt <= 0:
+            derivative = 0.0
+        else:
+            error = self.target_speed - current_speed
+            derivative = (error - self.prev_error) / dt
+            self.prev_error = error
+
+        error = self.target_speed - current_speed
+        self.integral += error * max(dt, 1e-6)
+
+        P = self.kp * error
+        I = self.ki * self.integral
+        D = self.kd * derivative
+        output = P + I + D
+
+        # 로그 저장
+        self.log_error.append(error)
+        self.log_P.append(P)
+        self.log_I.append(I)
+        self.log_D.append(D)
+        self.log_output.append(output)
+        self.log_target_speed.append(self.target_speed)
+        self.log_current_speed.append(current_speed)
+
+        # actuator command 한계 (0..1)
+        return max(min(output, 1.0), 0.0)
+
+
+# =====================================================
+# Controller Worker (백그라운드 스레드)
+# - MORAI 데이터 수신, PID/PurePursuit 계산, 제어 송신
+# - 최신 스냅샷을 queue에 덮어쓰기 방식으로 보냄
+# =====================================================
+def controller_worker(path_x, path_y, state_q: queue.Queue, stop_event: threading.Event):
+    receiver = Receiver(RECV_IP, RECV_PORT, EgoNoisyInfoStatus())
+    sender = Sender(RECV_IP, SEND_PORT)
+    pp = PurePursuit(lookahead=20.0)
+    pid = PID(kp=0.3, ki=0, kd=0.05, target_speed=150.0)
+
+    prev_time = time.time()
+    step = 0
+
+    while not stop_event.is_set():
+        step += 1
+        now = time.time()
+        dt = now - prev_time
+        prev_time = now
+
+        # 안전: 너무 큰 dt 발생 시 cap (원하면 제거)
+        if dt > 1.0:
+            dt = 0.01
+
+        try:
+            ego = receiver.get_data()
+        except Exception as e:
+            print("Receiver error:", e)
+            time.sleep(0.01)
+            continue
+
+        # ego 데이터 읽기 (추정 필드 이름은 사용자 환경에 맞게 수정)
+        x, y = ego.noisy_pos_e, ego.noisy_pos_n
+        yaw = math.radians(ego.noisy_ori_y)
+        speed = math.hypot(ego.noisy_vel_e, ego.noisy_vel_n)
+
+        accel = pid.compute(speed, dt)
+        steer = pp.compute_steering(x, y, yaw, path_x, path_y)
+
+        # predicted path (worker 내부에서 계산)
+        pred_x, pred_y = predict_pure_pursuit_path(x, y, yaw, steer, pp.wheelbase, horizon=20, ds=0.3)
+
+        # 제어명령 전송
+        cmd = EgoCtrlCmd()
+        cmd.ctrl_mode = 2
+        cmd.cmd_type = 1
+        cmd.gear = 4
+        cmd.accel = accel
+        cmd.brake = 0.0
+        cmd.steer = steer
+        try:
+            sender.send(cmd)
+        except Exception as e:
+            # 전송 실패시 로그만 남기고 계속
+            print("Sender error:", e)
+
+        # 로그 출력 (선택)
+        print_step_log(step, x, y, yaw, speed, steer, accel, dt)
+
+        # 스냅샷 생성 (copy해서 보냄)
+        snapshot = {
+            'step': step,
+            'x': x, 'y': y, 'yaw': yaw, 'speed': speed,
+            'steer': steer, 'accel': accel, 'dt': dt,
+            'pred_x': list(pred_x), 'pred_y': list(pred_y),
+            # PID logs (전부 보내도 괜찮음)
+            'pid_error': list(pid.log_error),
+            'pid_P': list(pid.log_P),
+            'pid_I': list(pid.log_I),
+            'pid_D': list(pid.log_D),
+            'pid_output': list(pid.log_output),
+            'target_speed': list(pid.log_target_speed),
+            'current_speed': list(pid.log_current_speed),
+        }
+
+        # queue에 최신 스냅샷만 남기도록 덮어쓰기
+        try:
+            if state_q.full():
+                try:
+                    state_q.get_nowait()
+                except queue.Empty:
+                    pass
+            state_q.put_nowait(snapshot)
+        except Exception:
+            # put_nowait 실패 시 무시
+            pass
+
+        # 컨트롤 루프 주기 제어(필요시 추가). 기본은 가능한 빨리.
+        # time.sleep(0.001)  # 너무 길면 제어 주기가 느려짐 — 필요에 따라 조정
+
+
+# =====================================================
+# Main Thread: Matplotlib GUI (메인 스레드에서만 실행)
+# - state_q에서 최신 snapshot 읽어서 plot 갱신
+# =====================================================
+def gui_loop(path_x, path_y, state_q: queue.Queue, stop_event: threading.Event):
+    plt.ion()
+    # 예측경로 + 글로벌 경로 플롯
+    fig = plt.figure(constrained_layout=True, figsize=(12, 8))
+    gs = fig.add_gridspec(2, 2)
+
+    ax_map = fig.add_subplot(gs[:, 0])
+    ax_pid_error = fig.add_subplot(gs[0, 1])
+    ax_pid_terms = fig.add_subplot(gs[1, 1])
+    # (우리는 PID를 두 개 패널에 분리해서 그릴 거임: error/ output vs speed)
+    # 위는 단순 구성. 아래에서 추가적으로 선을 세팅.
+
+    ax_map.plot(path_x, path_y, label="Global Path", linewidth=1)
+    line_pred, = ax_map.plot([], [], 'r', label="Predicted Path", linewidth=2)
+    ego_point, = ax_map.plot([], [], 'ko', label="Ego")
+    ax_map.legend()
+    ax_map.set_aspect('equal', adjustable='datalim')
+    ax_map.grid(True)
+
+    # PID: error + output in ax_pid_error
+    line_err, = ax_pid_error.plot([], [], label='Error')
+    line_out, = ax_pid_error.plot([], [], label='PID Output')
+    ax_pid_error.legend()
+    ax_pid_error.grid(True)
+
+    # speed tracking and P/I/D terms in ax_pid_terms
+    line_t_speed, = ax_pid_terms.plot([], [], label='Target Speed')
+    line_c_speed, = ax_pid_terms.plot([], [], label='Current Speed')
+    ax_pid_terms.legend()
+    ax_pid_terms.grid(True)
+
+    plt.show(block=False)
+
+    last_snapshot = None
+    try:
+        while not stop_event.is_set():
+            # 최신 스냅샷이 있을 경우 가져와서 처리 (있을 때만 갱신)
+            try:
+                snapshot = state_q.get_nowait()
+                last_snapshot = snapshot
+            except queue.Empty:
+                snapshot = last_snapshot  # 이전 값 계속 사용
+
+            if snapshot is not None:
+                # 지도/예측 경로 업데이트
+                if 'pred_x' in snapshot:
+                    line_pred.set_xdata(snapshot['pred_x'])
+                    line_pred.set_ydata(snapshot['pred_y'])
+                    ego_point.set_xdata([snapshot['x']])
+                    ego_point.set_ydata([snapshot['y']])
+
+                # PID 에러/출력 업데이트
+                err = snapshot.get('pid_error', [])
+                out = snapshot.get('pid_output', [])
+                xs = range(len(err))
+                line_err.set_data(xs, err)
+                line_out.set_data(xs, out)
+                ax_pid_error.relim()
+                ax_pid_error.autoscale_view()
+
+                # 속도 비교 업데이트
+                t_spd = snapshot.get('target_speed', [])
+                c_spd = snapshot.get('current_speed', [])
+                xs2 = range(len(c_spd))
+                line_t_speed.set_data(xs2, t_spd)
+                line_c_speed.set_data(xs2, c_spd)
+                ax_pid_terms.relim()
+                ax_pid_terms.autoscale_view()
+
+                # 전체 플롯 리프레시
+                fig.canvas.draw_idle()
+
+            # plt.pause는 메인스레드에서만 호출되어야 함 (여기서 안전)
+            plt.pause(0.03)  # GUI 업데이트 간격: 약 30ms (≈33Hz)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        plt.ioff()
+        plt.close('all')
+
+
+# =====================================================
+# Entry Point: 스레드 생성 및 시작
+# =====================================================
+if __name__ == '__main__':
+    path_x, path_y = load_global_path(csv_path)
+
+    # 최신 상태만 유지하는 큐 (maxsize=1)
+    state_q = queue.Queue(maxsize=1)
+    stop_event = threading.Event()
+
+    # controller worker 스레드 시작 (백그라운드)
+    worker_thread = threading.Thread(
+        target=controller_worker,
+        args=(path_x, path_y, state_q, stop_event),
+        daemon=True
+    )
+    worker_thread.start()
+
+    try:
+        # GUI 루프는 메인 스레드에서 실행해야 함
+        gui_loop(path_x, path_y, state_q, stop_event)
+    finally:
+        # 종료 신호
+        stop_event.set()
+        # worker는 daemon이라서 프로세스 종료 시 자동 종료되지만 join 해도 안전
+        worker_thread.join(timeout=1.0)
+        print("Exited cleanly.")

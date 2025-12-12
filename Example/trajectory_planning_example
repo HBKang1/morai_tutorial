@@ -1,0 +1,292 @@
+import csv
+import time
+import math
+import sys
+import threading
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+
+# project_root = 현재 실행 디렉토리
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(PROJECT_ROOT / "MORAI_UDP_NetworkModule"))
+
+from lib.network.UDP import Receiver, Sender
+from lib.define.EgoNoisyInfoStatus import EgoNoisyInfoStatus
+from lib.define.EgoCtrlCmd import EgoCtrlCmd
+
+RECV_IP = '127.0.0.1'
+RECV_PORT = 9104
+SEND_PORT = 9093
+csv_path = "data/path.csv"
+
+# =====================================================
+# Global Path Loader
+# =====================================================
+def load_global_path(csv_path):
+    xs, ys = [], []
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            xs.append(float(row['PositionX (m)']))
+            ys.append(float(row['PositionY (m)']))
+    return xs, ys
+
+
+# =====================================================
+# print_step_log
+# =====================================================
+def print_step_log(step, x, y, yaw, speed, steer, accel, dt):
+    print(f"[Step {step}] "
+          f"Pos=({x:.2f}, {y:.2f})  "
+          f"Yaw={math.degrees(yaw):.2f}°  "
+          f"Speed={speed:.2f} m/s  "
+          f"Steer={math.degrees(steer):.2f}°  "
+          f"Accel={accel:.3f}  dt={dt:.3f}")
+
+
+# =====================================================
+# Pure Pursuit Predicted Path
+# =====================================================
+def predict_pure_pursuit_path(x, y, yaw, steer, wheelbase, horizon=20, ds=0.5):
+    k = math.tan(steer * 0.6) / wheelbase
+
+    pred_x = [x]
+    pred_y = [y]
+    pred_yaw = yaw
+
+    for _ in range(int(horizon / ds)):
+        x += ds * math.cos(pred_yaw)
+        y += ds * math.sin(pred_yaw)
+        pred_yaw += ds * k
+
+        pred_x.append(x)
+        pred_y.append(y)
+
+    return pred_x, pred_y
+
+# =====================================================
+# Pure Pursuit Controller
+# =====================================================
+class PurePursuit:
+    def __init__(self, lookahead=5.0, wheelbase=2.8):
+        self.lookahead = lookahead
+        self.wheelbase = wheelbase
+
+    def compute_steering(self, x, y, yaw, path_x, path_y):
+        min_dist = float('inf')
+        closest_idx = 0
+        for i in range(len(path_x)):
+            d = (path_x[i] - x)**2 + (path_y[i] - y)**2
+            if d < min_dist:
+                min_dist = d
+                closest_idx = i
+
+        target_idx = closest_idx
+        for i in range(closest_idx, len(path_x)):
+            if math.hypot(path_x[i] - x, path_y[i] - y) >= self.lookahead:
+                target_idx = i
+                break
+
+        tx, ty = path_x[target_idx], path_y[target_idx]
+
+        dx = math.cos(-yaw) * (tx - x) - math.sin(-yaw) * (ty - y)
+        dy = math.sin(-yaw) * (tx - x) + math.cos(-yaw) * (ty - y)
+
+        steer = math.atan2(2 * self.wheelbase * dy, self.lookahead**2)
+        return max(min(steer / 0.6, 1.0), -1.0)
+
+# =====================================================
+# PID Controller
+# =====================================================
+class PID:
+    def __init__(self, kp, ki, kd, target_speed):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.target_speed = target_speed
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+        self.log_error = []
+        self.log_P = []
+        self.log_I = []
+        self.log_D = []
+        self.log_output = []
+
+        self.log_target_speed = []
+        self.log_current_speed = []
+
+    def compute(self, current_speed, dt):
+        error = self.target_speed - current_speed
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt
+        self.prev_error = error
+
+        P = self.kp * error
+        I = self.ki * self.integral
+        D = self.kd * derivative
+        output = P + I + D
+
+        self.log_error.append(error)
+        self.log_P.append(P)
+        self.log_I.append(I)
+        self.log_D.append(D)
+        self.log_output.append(output)
+
+        self.log_target_speed.append(self.target_speed)
+        self.log_current_speed.append(current_speed)
+
+        return max(min(output, 1.0), 0.0)
+
+
+# =====================================================
+# 시각화 스레드: Predicted Path Plot
+# =====================================================
+def predicted_path_plotter(follower):
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    ax.plot(follower.path_x, follower.path_y, label="Global Path", linewidth=2)
+    line_pred, = ax.plot([], [], 'r', label="Predicted Path", linewidth=2)
+    ax.legend()
+    ax.grid(True)
+    ax.axis("equal")
+
+    while True:
+        if follower.last_pred_x is not None:
+            line_pred.set_xdata(follower.last_pred_x)
+            line_pred.set_ydata(follower.last_pred_y)
+
+            ax.relim()
+            ax.autoscale_view()
+
+            plt.pause(0.01)
+
+        time.sleep(0.03)  # 30ms마다 업데이트
+
+
+# =====================================================
+# 시각화 스레드: PID Plot
+# =====================================================
+def pid_plotter(pid):
+    plt.ion()
+    fig2, ax2 = plt.subplots(6, 1, figsize=(8, 14))
+
+    titles = [
+        "Error", "P term", "I term", "D term",
+        "PID Output", "Speed Tracking"
+    ]
+
+    lines = []
+    for i in range(6):
+        ax2[i].set_ylabel(titles[i])
+        ax2[i].grid(True)
+        if i < 5:
+            line, = ax2[i].plot([], [])
+            lines.append(line)
+        else:
+            line_t, = ax2[i].plot([], [], label="Target Speed")
+            line_c, = ax2[i].plot([], [], label="Current Speed")
+            ax2[i].legend()
+            lines.append((line_t, line_c))
+
+    plt.tight_layout()
+
+    prev_len = 0
+    while True:
+        cur = len(pid.log_error)
+        if cur - prev_len > 20:
+            prev_len = cur
+
+            lines[0].set_data(range(cur), pid.log_error)
+            lines[1].set_data(range(cur), pid.log_P)
+            lines[2].set_data(range(cur), pid.log_I)
+            lines[3].set_data(range(cur), pid.log_D)
+            lines[4].set_data(range(cur), pid.log_output)
+
+            line_t, line_c = lines[5]
+            line_t.set_data(range(cur), pid.log_target_speed)
+            line_c.set_data(range(cur), pid.log_current_speed)
+
+            for ax in ax2:
+                ax.relim()
+                ax.autoscale_view()
+
+            plt.pause(0.001)
+
+        time.sleep(0.03)
+
+
+# =====================================================
+# Main MORAI Controller
+# =====================================================
+class MoraiPathFollower:
+    def __init__(self, path_file, recv_ip, recv_port, send_ip, send_port):
+
+        self.path_x, self.path_y = load_global_path(path_file)
+        self.receiver = Receiver(recv_ip, recv_port, EgoNoisyInfoStatus())
+        self.sender = Sender(send_ip, send_port)
+
+        self.pure_pursuit = PurePursuit(lookahead=20.0)
+        self.pid = PID(kp=0.5, ki=0.05, kd=0.1, target_speed=100.0)
+
+        self.last_pred_x = None  # 스레드 접근용
+        self.last_pred_y = None
+
+    def run(self):
+        # === 1) 시각화 스레드 시작 ===
+        threading.Thread(target=predicted_path_plotter, args=(self,), daemon=True).start()
+        threading.Thread(target=pid_plotter, args=(self.pid,), daemon=True).start()
+
+        prev_time = time.time()
+        step = 0
+
+        try:
+            while True:
+                step += 1
+                now = time.time()
+                dt = now - prev_time
+                prev_time = now
+
+                ego = self.receiver.get_data()
+                x, y = ego.noisy_pos_e, ego.noisy_pos_n
+                yaw = math.radians(ego.noisy_ori_y)
+                speed = math.hypot(ego.noisy_vel_e, ego.noisy_vel_n)
+
+                accel = self.pid.compute(speed, dt)
+                steer = self.pure_pursuit.compute_steering(
+                    x, y, yaw, self.path_x, self.path_y
+                )
+
+                print_step_log(step, x, y, yaw, speed, steer, accel, dt)
+
+                # 예측 경로 계산 → 스레드가 시각화
+                self.last_pred_x, self.last_pred_y = predict_pure_pursuit_path(
+                    x, y, yaw, steer, self.pure_pursuit.wheelbase,
+                    horizon=20, ds=0.3
+                )
+
+                cmd = EgoCtrlCmd()
+                cmd.ctrl_mode = 2
+                cmd.cmd_type = 1
+                cmd.gear = 4
+                cmd.accel = accel
+                cmd.brake = 0.0
+                cmd.steer = steer
+
+                self.sender.send(cmd)
+
+        except KeyboardInterrupt:
+            print("Simulation stopped by user.")
+
+# =====================================================
+# Entry Point
+# =====================================================
+if __name__ == '__main__':
+    follower = MoraiPathFollower(
+        csv_path,
+        recv_ip=RECV_IP, recv_port=RECV_PORT,
+        send_ip=RECV_IP, send_port=SEND_PORT
+    )
+    follower.run()
