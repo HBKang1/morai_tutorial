@@ -229,7 +229,7 @@ class MoraiPathFollower:
         self.sender = Sender(send_ip, send_port)
 
         self.pure_pursuit = PurePursuit(lookahead=20.0)
-        self.pid = PID(kp=0.5, ki=0.05, kd=0.1, target_speed=100.0)
+        self.pid = PID(kp=0.6, ki=0.05, kd=0.1, target_speed=100.0)
 
         self.last_pred_x = None  # 스레드 접근용
         self.last_pred_y = None
